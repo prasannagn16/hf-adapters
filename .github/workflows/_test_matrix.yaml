@@ -173,6 +173,12 @@ env:
   CLONED_HF_ADAPTERS_DIR: ${{ github.workspace }}
   STORAGE_1_DIR: /storage-1/hf-adapters
   HF_HOME: /storage-1/hf-adapters/.cache/huggingface
+  # Registry models are pre-warmed in the HF_HOME PVC; offline mode skips the Hub revision-check request that from_pretrained() otherwise makes even on a cache hit.
+  HF_HUB_OFFLINE: "1"
+  # Stock VLM logits/captions are independent of hf-adapters and expensive to
+  # regenerate on CPU. The test keys these compact references by model commit,
+  # stack versions, generation settings, dtype, prompt, and input tensor bytes.
+  HF_ADAPTERS_VLM_REF_CACHE: /storage-1/hf-adapters/.cache/vlm-references
   # Single source of truth for the set of models exercised by the CPU
   # test matrix's `-k` filter. PR is the fast smoke — qwen3 (causal LM) and
   # bge_base (embedding) on CPU; the same bge_base runs on the Spyre
@@ -229,7 +235,7 @@ jobs:
         with:
           name: run-id
           path: run-id.txt
-          retention-days: 1
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # Resolve the torch-spyre revision ONCE per run and pin it (issue #449).
@@ -300,6 +306,54 @@ jobs:
             echo "| job | hf-adapters SHA | torch-spyre SHA |"
             echo "|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # One `artifact-id` record per run for push-test-results-to-clickhouse's v2 ingest. Must run
+  # on the image under test: the base artifact_id lives in its filesystem. Never gates the run.
+  artifact-identity:
+    name: Derive artifact identity
+    needs: [resolve-torch-spyre]
+    if: ${{ always() && !inputs.skip_tests && (needs.resolve-torch-spyre.result == 'success' || needs.resolve-torch-spyre.result == 'skipped') }}
+    continue-on-error: true
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - ${{ inputs.image_label }}
+    timeout-minutes: 10
+    steps:
+      # At torch-spyre main, the same ref the v2 ingest action runs, so both use one id formula.
+      - name: Checkout the identity library
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: torch-spyre/torch-spyre
+          ref: main
+          path: .torch-spyre-identity
+          sparse-checkout: |
+            .github/scripts/derive_artifact_id.py
+            extensions/clickhouse-ingest
+          sparse-checkout-cone-mode: false
+
+      # hf-adapters always runs from a fresh clone; torch-spyre is on top only when pinned.
+      - name: Describe what this run installs on top of the image
+        id: delta
+        env:
+          HEAD_SHA: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          TORCH_SPYRE_SHA: ${{ needs.resolve-torch-spyre.outputs.torch_spyre_sha }}
+        run: |
+          TOKENS="hf-adapters@${HEAD_SHA:0:12}"
+          if [[ -n "${TORCH_SPYRE_SHA}" ]]; then
+            TOKENS="${TOKENS} torch-spyre@${TORCH_SPYRE_SHA:0:12}"
+          fi
+          echo "installed on top: ${TOKENS}"
+          echo "installed=${TOKENS}" >> "$GITHUB_OUTPUT"
+
+      - name: Derive and upload the artifact identity
+        uses: torch-spyre/torch-spyre/.github/actions/derive-gha-artifact-id@main
+        with:
+          component: hf-adapters
+          arch: x86_64
+          installed: ${{ steps.delta.outputs.installed }}
+          library-dir: ${{ github.workspace }}/.torch-spyre-identity
 
   pre-commit:
     name: pre-commit
@@ -395,6 +449,8 @@ jobs:
   # Generates spyre-model-module-tests' matrix from the tests/configs/module_tests/
   # directory of the SAME ref+repository that build-hf-adapters is about to check
   # out (inputs.ref/inputs.repository), instead of a filename list hardcoded here.
+  # Configs measured above 10 minutes are expanded into method-level shards by
+  # generate_module_test_matrix.py; all other configs remain one matrix entry.
   #
   # Why this exists: this reusable workflow file is resolved at whichever ref
   # GitHub's workflow_dispatch call targets (dispatch_ref), while the source tree
@@ -423,6 +479,12 @@ jobs:
       run:
         working-directory: .
     steps:
+      - name: Checkout module-test matrix generator
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/scripts/generate_module_test_matrix.py
+          sparse-checkout-cone-mode: false
+
       - name: List tests/configs/module_tests at the ref under test
         id: generate
         env:
@@ -441,11 +503,8 @@ jobs:
           git clone --filter=blob:none --no-checkout "$CLONE_URL" repo
           cd repo
           git checkout --force "$TARGET_REF"
-          cd tests/configs/module_tests
           # *vllm* configs self-skip (vllm package not importable here), same as Jenkins -- keep them so counts match.
-          configs=$(ls *.yaml | jq -R -s -c 'split("\n")[:-1]')
-          echo "Configs found at ${TARGET_REF}: ${configs}"
-          echo "module_config_matrix=${configs}" >> "$GITHUB_OUTPUT"
+          python3 ../.github/scripts/generate_module_test_matrix.py tests/configs/module_tests
 
   adapter-coverage:
     name: adapter coverage
@@ -832,6 +891,10 @@ jobs:
           MODEL_PATH: ${{ matrix.model_key }}
           MODEL_DTYPE: float16
           SPYRE_DEVICES: "0,1"
+          # spyre-comms 173 made Offload_AllGatherSum the default below 8 MiB,
+          # but it corrupts Granite's rank-local residual reductions. Keep this
+          # TP=2 correctness test on the previously stable algorithm.
+          COLL_ALLREDUCE_ALGO: "PairwisePow2"
           HF_DEACTIVATE_ASYNC_LOAD: "1"
           PYTHONUNBUFFERED: "1"
         run: |
@@ -980,7 +1043,7 @@ jobs:
           pinned_torch_spyre_sha: ${{ needs.resolve-torch-spyre.outputs.torch_spyre_sha }}
           hf_adapters_sha: ${{ steps.build.outputs.target_sha }}
 
-      - name: Run test_model_components_spyre.py
+      - name: Run model component tests
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
@@ -1795,7 +1858,7 @@ jobs:
           payload: '{"model_key": ${{ toJSON(matrix.model_key) }}, "test_file": ${{ toJSON(matrix.test_file) }}}'
 
   spyre-model-module-tests:
-    name: Spyre model-module tests (${{ matrix.config }})
+    name: Spyre model-module tests (${{ matrix.config }}, ${{ matrix.shard }})
     needs: [resolve-test-type, generate-module-config-matrix, resolve-torch-spyre]
     # Suite key: "model_module". Part of the "unit" coarse tier.
     # resolve-torch-spyre guard: run on pin-success OR pin-skipped (prebaked),
@@ -1811,11 +1874,9 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix:
-        # Dynamic matrix: every tests/configs/module_tests/*.yaml file at the ref
-        # under test (see generate-module-config-matrix above) -- not a filename
-        # list hardcoded here, which can silently drift from the actual tree.
-        config: ${{ fromJSON(needs.generate-module-config-matrix.outputs.module_config_matrix) }}
+      # Dynamic include matrix: every tests/configs/module_tests/*.yaml file at
+      # the ref under test, with measured slow configs expanded into shards.
+      matrix: ${{ fromJSON(needs.generate-module-config-matrix.outputs.module_config_matrix) }}
 
     steps:
       - name: Checkout composite actions
@@ -1848,21 +1909,23 @@ jobs:
           pinned_torch_spyre_sha: ${{ needs.resolve-torch-spyre.outputs.torch_spyre_sha }}
           hf_adapters_sha: ${{ steps.build.outputs.target_sha }}
 
-      - name: Run module tests for ${{ matrix.config }}
+      - name: Run module tests for ${{ matrix.config }} (${{ matrix.shard }})
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           cd "$CLONED_HF_ADAPTERS_DIR"
-          make model-module-tests MODULE_CONFIG=${{ matrix.config }} PYTEST_ARGS='${{ inputs.extra_test_flags }}' \
+          make model-module-tests MODULE_CONFIG=${{ matrix.config }} \
+            MODULE_TEST_FILTER='${{ matrix.pytest_filter }}' PYTEST_ARGS='${{ inputs.extra_test_flags }}' \
             JUNIT_XML=1 RESULTS_DIR=.
-          mv "model-module-${{ matrix.config }}.xml" "junit-model-module-${{ matrix.config }}.xml"
+          mv "model-module-${{ matrix.config }}.xml" \
+            "junit-model-module-${{ matrix.config }}-${{ matrix.shard }}.xml"
 
       - name: Upload JUnit results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: junit-model-module-${{ matrix.config }}
-          path: ${{ env.CLONED_HF_ADAPTERS_DIR }}/junit-model-module-${{ matrix.config }}.xml
+          name: junit-model-module-${{ matrix.config }}-${{ matrix.shard }}
+          path: ${{ env.CLONED_HF_ADAPTERS_DIR }}/junit-model-module-${{ matrix.config }}-${{ matrix.shard }}.xml
           retention-days: 14
 
       - name: Save suite descriptor for pod-level retry
@@ -1870,7 +1933,7 @@ jobs:
         uses: ./.github/actions/save-failed-suite-descriptor
         with:
           job_key: model_module
-          payload: '{"config": ${{ toJSON(matrix.config) }}}'
+          payload: '{"config": ${{ toJSON(matrix.config) }}, "shard": ${{ toJSON(matrix.shard) }}, "pytest_filter": ${{ toJSON(matrix.pytest_filter) }}}'
 
   # Pod-level retry (mirrors torch-spyre's _test_matrix.yaml): every spyre-*-tests job above is continue-on-error and uploads a "failed-suite-<key>-<attempt>-<idx>" descriptor artifact on a failed leg; this job downloads those descriptors and rebuilds one retry matrix per suite type for the *-retry jobs below to re-run on brand-new pods.
   collect-failed-suites:
@@ -2191,6 +2254,8 @@ jobs:
           MODEL_PATH: ${{ matrix.model_key }}
           MODEL_DTYPE: float16
           SPYRE_DEVICES: "0,1"
+          # Match the primary TP job's stable all-reduce selection.
+          COLL_ALLREDUCE_ALGO: "PairwisePow2"
           HF_DEACTIVATE_ASYNC_LOAD: "1"
           PYTHONUNBUFFERED: "1"
         run: |
@@ -2318,7 +2383,7 @@ jobs:
           pinned_torch_spyre_sha: ${{ needs.resolve-torch-spyre.outputs.torch_spyre_sha }}
           hf_adapters_sha: ${{ steps.build.outputs.target_sha }}
 
-      - name: Run test_model_components_spyre.py (pod-level retry)
+      - name: Run model component tests (pod-level retry)
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
@@ -2925,7 +2990,7 @@ jobs:
           overwrite: true
 
   spyre-model-module-tests-retry:
-    name: Spyre model-module tests (${{ matrix.config }}) (pod-level retry)
+    name: Spyre model-module tests (${{ matrix.config }}, ${{ matrix.shard }}) (pod-level retry)
     needs: [collect-failed-suites, resolve-torch-spyre]
     if: ${{ always() && needs.collect-failed-suites.outputs.has_failed_model_module == 'true' }}
     runs-on:
@@ -2968,21 +3033,23 @@ jobs:
           pinned_torch_spyre_sha: ${{ needs.resolve-torch-spyre.outputs.torch_spyre_sha }}
           hf_adapters_sha: ${{ steps.build.outputs.target_sha }}
 
-      - name: Run module tests for ${{ matrix.config }} (pod-level retry)
+      - name: Run module tests for ${{ matrix.config }} (${{ matrix.shard }}) (pod-level retry)
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           cd "$CLONED_HF_ADAPTERS_DIR"
-          make model-module-tests MODULE_CONFIG=${{ matrix.config }} PYTEST_ARGS='${{ inputs.extra_test_flags }}' \
+          make model-module-tests MODULE_CONFIG=${{ matrix.config }} \
+            MODULE_TEST_FILTER='${{ matrix.pytest_filter }}' PYTEST_ARGS='${{ inputs.extra_test_flags }}' \
             JUNIT_XML=1 RESULTS_DIR=.
-          mv "model-module-${{ matrix.config }}.xml" "junit-model-module-${{ matrix.config }}.xml"
+          mv "model-module-${{ matrix.config }}.xml" \
+            "junit-model-module-${{ matrix.config }}-${{ matrix.shard }}.xml"
 
       - name: Upload JUnit results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: junit-model-module-${{ matrix.config }}
-          path: ${{ env.CLONED_HF_ADAPTERS_DIR }}/junit-model-module-${{ matrix.config }}.xml
+          name: junit-model-module-${{ matrix.config }}-${{ matrix.shard }}
+          path: ${{ env.CLONED_HF_ADAPTERS_DIR }}/junit-model-module-${{ matrix.config }}-${{ matrix.shard }}.xml
           retention-days: 14
           overwrite: true
 

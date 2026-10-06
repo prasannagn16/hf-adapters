@@ -176,6 +176,12 @@ def prepare_for_spyre(model):
         "this checkpoint has no vision_config."
     )
 
+    # VLM prefill contains bidirectional vision regions. The mask remains the
+    # source of exact semantics; the non-causal flag selects the generic kernel
+    # access plan so those future image-token edges are reachable.
+    model._spyre_swa_mode = "anchored"
+    model._spyre_swa_is_causal = False
+
     # Reuse the text adapter selected by the nested decoder configuration.
     if getattr(cfg, "enable_moe_block", False):
         hf_gemma4_moe.prepare_text_decoder_for_spyre(model)
@@ -399,6 +405,8 @@ def _logits_from_embeds(
     masks=None,
     input_ids=None,
     ple_context_embeds=None,
+    *,
+    logits_to_keep=0,
 ):
     """Text decoder over image-scattered embeds → logits (+ softcap).
 
@@ -448,7 +456,7 @@ def _logits_from_embeds(
         per_layer_inputs=per_layer_inputs,
         query_row_mask=query_row_mask,
     )
-    return run_lm_head(model, h)
+    return run_lm_head(model, h, logits_to_keep=logits_to_keep)
 
 
 def _prefill_forward(
@@ -463,14 +471,17 @@ def _prefill_forward(
     pixel_values,
     image_position_ids,
     mm_token_type_ids,
+    logits_to_keep=0,
 ):
-    """Shared multimodal prefill: padded ids + image → full-sequence logits.
+    """Shared multimodal prefill: padded ids + image → requested logits.
 
     Builds scaled text embeddings with the image features scattered into the
     ``<image>`` slots, then the architecture-specific blockwise vision masks,
     and runs the decoder once (writing the KV caches).
     ``mm_token_type_ids`` has already undergone
     the same prompt compaction and block padding as ``input_ids``.
+    ``logits_to_keep=1`` projects only the final row for generation; the default
+    keeps full-sequence logits for direct callers.
     """
     dtype = get_model_dtype(model)
     cfg = text_config(model.config)
@@ -500,6 +511,7 @@ def _prefill_forward(
         value_caches,
         cache_index=cache_index,
         masks=masks,
+        logits_to_keep=logits_to_keep,
         input_ids=ple_input_ids.to(DEVICE),
         ple_context_embeds=(
             ple_context_embeds.to(DEVICE) if ple_context_embeds is not None else None

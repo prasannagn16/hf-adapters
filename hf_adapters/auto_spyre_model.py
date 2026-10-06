@@ -84,6 +84,10 @@ from transformers import (
     Phi3Config,
     PreTrainedModel,
     Qwen2Config,
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+    Qwen3_5TextConfig,
     Qwen3Config,
     RobertaConfig,
     SmolLM3Config,
@@ -140,6 +144,8 @@ from hf_adapters import (
     hf_phi3,
     hf_qwen2,
     hf_qwen3,
+    hf_qwen3_5,
+    hf_qwen3_5_moe,
     hf_smollm3,
     hf_xlm_roberta,
 )
@@ -185,6 +191,10 @@ CONFIG_TO_ADAPTER_MODULE_MAPPING: dict[type[PretrainedConfig], ModuleType] = {
     Phi3Config: hf_phi3,
     Qwen2Config: hf_qwen2,
     Qwen3Config: hf_qwen3,
+    Qwen3_5Config: hf_qwen3_5,
+    Qwen3_5TextConfig: hf_qwen3_5,
+    Qwen3_5MoeConfig: hf_qwen3_5_moe,
+    Qwen3_5MoeTextConfig: hf_qwen3_5_moe,
     RobertaConfig: hf_xlm_roberta,
     SmolLM3Config: hf_smollm3,
     XLMRobertaConfig: hf_xlm_roberta,
@@ -314,8 +324,11 @@ def dtype_for_model_path(
         config = _autoconfig_with_subfolder_fallback(
             model_name_or_path, trust_remote_code=trust_remote_code
         )
+        text_config = getattr(config, "text_config", None)
         dtype = (
-            getattr(config, "dtype", None) or torch.float16 if config else torch.float16
+            getattr(text_config, "dtype", None)
+            or getattr(config, "dtype", None)
+            or torch.float16
         )
 
     if dtype == torch.float32 and device_str == "spyre":
@@ -455,6 +468,7 @@ class AutoSpyreModelForCausalLM(AutoSpyreModel):
                 self,
                 input_ids,
                 attention_mask=attention_mask,
+                prefill_backbone_fn=module._run_backbone_forward,
                 **kwargs,
             )
 
@@ -903,7 +917,9 @@ def _generate_image_text_to_text(
     }
 
     # Only prefill is multimodal; subsequent decode steps are ordinary text.
-    prefill_fn = partial(module._prefill_forward, **pass_through_inputs)
+    prefill_fn = partial(
+        module._prefill_forward, logits_to_keep=1, **pass_through_inputs
+    )
     run_forward_fn = partial(_run_vlm_text_forward, module)
 
     return hf_common.generate(
